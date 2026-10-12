@@ -1,0 +1,68 @@
+[
+  {
+    "name": "file_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Path and name of the object in Cloud Storage"
+  },
+  {
+    "name": "bucket_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Source Cloud Storage bucket"
+  },
+  {
+    "name": "file_size_bytes",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "File size in bytes"
+  },
+  {
+    "name": "mime_type",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Detected or reported MIME content type"
+  },
+  {
+    "name": "upload_date",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE",
+    "description": "Creation timestamp in Cloud Storage"
+  },
+  {
+    "name": "processed_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Timestamp when pipeline processed the document"
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Processing status: SUCCESS or ERROR"
+  },
+  {
+    "name": "word_count",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "Extracted or simulated document word count"
+  },
+  {
+    "name": "tags",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Extracted keyword and topic classification tags"
+  },
+  {
+    "name": "ocr_preview_snippet",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Preview snippet of extracted OCR text (up to 200 chars)"
+  },
+  {
+    "name": "error_message",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Error description or stack trace if processing failed"
+  }
+]
