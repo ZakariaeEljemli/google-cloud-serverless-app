@@ -115,7 +115,7 @@ if [[ -z "${EXISTING_NOTIF}" ]]; then
   gcloud storage buckets notifications create "gs://${BUCKET_NAME}" \
     --topic="${TOPIC_NAME}" \
     --event-types="OBJECT_FINALIZE" \
-    --payload-format="JSON_API_V1"
+    --payload-format="json"
 else
   echo "Notification already configured for topic ${TOPIC_NAME}."
 fi

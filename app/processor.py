@@ -1,21 +1,29 @@
-"""Hybrid OCR and document metadata extraction engine.
+"""Document processor with Google Cloud Vision OCR and text extraction.
 
 Extracts text, word count, topic tags, and preview snippets from:
-1. Plain text and markdown documents
-2. PDF files (using pypdf)
-3. Images and binary formats via deterministic synthetic OCR simulation
+1. Plain text and markdown documents (native UTF-8 parsing)
+2. PDF files (native text extraction via pypdf + Vision OCR for scanned pages)
+3. Images and scans via Google Cloud Vision API (document_text_detection & label_detection)
 """
 
-import hashlib
 import io
+import logging
 import mimetypes
 import os
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pypdf import PdfReader
 
-# Standard English stop words to filter out when generating keyword tags
+try:
+    from google.cloud import vision
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+# Standard English stop words and generic document filler words
 STOP_WORDS: Set[str] = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
     "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
@@ -29,60 +37,12 @@ STOP_WORDS: Set[str] = {
     "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they",
     "this", "those", "through", "to", "too", "under", "until", "up", "very", "was",
     "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
-    "with", "won't", "would", "you", "your", "yours", "yourself", "yourselves"
+    "with", "won't", "would", "you", "your", "yours", "yourself", "yourselves",
+    # Common document filler words
+    "item", "items", "date", "dates", "page", "pages", "total", "subtotal", "amount",
+    "number", "numbers", "thank", "thanks", "due", "within", "days", "http", "https",
+    "www", "com", "net", "org", "email", "tel", "fax", "phone"
 }
-
-# Synthetic document templates for deterministic simulated OCR on image/binary files
-SYNTHETIC_TEMPLATES: List[Dict[str, Any]] = [
-    {
-        "category": "invoice",
-        "tags": ["invoice", "finance", "billing", "accounts-payable", "tax"],
-        "text_sample": (
-            "INVOICE #INV-84920\n"
-            "Vendor: Global Logistics & Supply Co.\n"
-            "Customer: Enterprise Systems Inc.\n"
-            "Date: 2026-10-12\n"
-            "Item 1: Cloud Architecture Consulting Services - $4,500.00\n"
-            "Item 2: Data Pipeline Infrastructure Setup - $2,750.00\n"
-            "Subtotal: $7,250.00 | Tax (8.5%): $616.25 | Total Due: $7,866.25\n"
-            "Payment Terms: Net 30 days. Thank you for your business."
-        ),
-    },
-    {
-        "category": "contract",
-        "tags": ["contract", "legal", "confidentiality", "compliance", "agreement"],
-        "text_sample": (
-            "MASTER SERVICES AGREEMENT\n"
-            "This Agreement is entered into by and between Provider and Customer.\n"
-            "1. Purpose and Scope of Services: Provider shall deliver event-driven software architectures.\n"
-            "2. Confidentiality and Data Protection: All data processed in Google Cloud Storage and BigQuery\n"
-            "shall remain protected under mutual NDA guidelines.\n"
-            "3. Term and Termination: Either party may terminate with 30 days written notice."
-        ),
-    },
-    {
-        "category": "medical_report",
-        "tags": ["medical", "health", "clinical", "diagnostic", "radiology"],
-        "text_sample": (
-            "CLINICAL LABORATORY & DIAGNOSTIC REPORT\n"
-            "Patient Identifier: Confidential\n"
-            "Specimen: Automated Digital Scan\n"
-            "Findings: Normal baseline parameters observed. No acute abnormalities detected.\n"
-            "Recommendation: Routine follow-up in twelve months. Document indexed for medical archival."
-        ),
-    },
-    {
-        "category": "technical_spec",
-        "tags": ["technical", "architecture", "serverless", "cloud", "documentation"],
-        "text_sample": (
-            "SYSTEM ARCHITECTURE SPECIFICATION\n"
-            "Component: Event-Driven Processing Pipeline\n"
-            "Ingestion: Google Cloud Storage bucket with object-finalize notifications.\n"
-            "Messaging: Pub/Sub push subscription triggering Google Cloud Run microservice.\n"
-            "Analytics: Real-time metadata streaming into BigQuery dataset with idempotency keys."
-        ),
-    },
-]
 
 
 def extract_keywords(text: str, max_tags: int = 5) -> List[str]:
@@ -100,7 +60,6 @@ def extract_keywords(text: str, max_tags: int = 5) -> List[str]:
     if not filtered:
         return ["document"]
 
-    # Count frequency while preserving order of appearance for ties
     freq: Dict[str, int] = {}
     for w in filtered:
         freq[w] = freq.get(w, 0) + 1
@@ -109,60 +68,75 @@ def extract_keywords(text: str, max_tags: int = 5) -> List[str]:
     return sorted_words[:max_tags]
 
 
-def simulate_ocr(file_name: str, content_bytes: bytes, mime_type: str) -> Dict[str, Any]:
-    """Generate deterministic simulated OCR text and metadata for images or binary files.
+def perform_vision_ocr(content_bytes: bytes) -> Tuple[str, List[str]]:
+    """Perform Optical Character Recognition using Google Cloud Vision API.
 
-    Uses a cryptographic digest of the file contents (or filename + length)
-    to deterministically select realistic document content and extract metrics.
+    Calls document_text_detection for dense text recognition and
+    label_detection for semantic topic tags.
 
     Args:
-        file_name: Name of the uploaded file.
-        content_bytes: Raw binary bytes.
-        mime_type: File MIME type.
+        content_bytes: Image binary data.
 
     Returns:
-        Dictionary containing word_count, tags, ocr_preview_snippet, and raw text length.
+        Tuple of (extracted_text, list_of_labels).
     """
-    seed_data = content_bytes if content_bytes else file_name.encode("utf-8")
-    digest = hashlib.sha256(seed_data).hexdigest()
-    template_idx = int(digest[:8], 16) % len(SYNTHETIC_TEMPLATES)
-    template = SYNTHETIC_TEMPLATES[template_idx]
+    if not VISION_AVAILABLE or not content_bytes:
+        return "", []
 
+    try:
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=content_bytes)
+
+        # 1. Dense document text detection
+        response = client.document_text_detection(image=image)
+        extracted_text = ""
+        if response.full_text_annotation and response.full_text_annotation.text:
+            extracted_text = response.full_text_annotation.text.strip()
+
+        # 2. Semantic label detection for classification tags
+        label_res = client.label_detection(image=image, max_results=5)
+        labels = [
+            lbl.description.lower().replace(" ", "-")
+            for lbl in label_res.label_annotations
+            if lbl.description
+        ]
+
+        return extracted_text, labels
+
+    except Exception as exc:
+        logger.warning(f"Google Cloud Vision OCR call failed or skipped: {exc}")
+        return "", []
+
+
+def fallback_metadata(
+    file_name: str,
+    content_bytes: bytes,
+    mime_type: str,
+    labels: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Construct honest metadata when no readable text layer is detected."""
     ext = os.path.splitext(file_name)[1].lower().strip(".")
-    text = template["text_sample"]
-    words = text.split()
-    word_count = len(words)
-
-    # Combine template tags with file format tag and keyword tags
-    tags = list(template["tags"][:3])
+    tags = []
     if ext:
         tags.append(f"format-{ext}")
-    extra_keywords = extract_keywords(text, max_tags=2)
-    for kw in extra_keywords:
-        if kw not in tags:
-            tags.append(kw)
+    if labels:
+        tags.extend(labels[:3])
+    if not tags:
+        tags = ["binary", "unindexed"]
 
-    preview = text[:200].replace("\n", " ")
+    preview = f"[File: {file_name} ({len(content_bytes)} bytes) - No extractable text]"
 
     return {
-        "word_count": word_count,
+        "word_count": 0,
         "tags": tags[:5],
         "ocr_preview_snippet": preview,
-        "raw_text_length": len(text),
+        "raw_text_length": 0,
         "mime_type": mime_type,
     }
 
 
 def process_text_document(content_bytes: bytes, mime_type: str) -> Dict[str, Any]:
-    """Process plain text, markdown, CSV, or JSON document.
-
-    Args:
-        content_bytes: Raw file bytes.
-        mime_type: MIME type of the file.
-
-    Returns:
-        Extracted metadata dictionary.
-    """
+    """Process plain text, markdown, CSV, or JSON document."""
     try:
         text = content_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -182,17 +156,10 @@ def process_text_document(content_bytes: bytes, mime_type: str) -> Dict[str, Any
     }
 
 
-def process_pdf_document(file_name: str, content_bytes: bytes, mime_type: str) -> Dict[str, Any]:
-    """Extract text from PDF, falling back to simulated OCR if no text layer exists.
-
-    Args:
-        file_name: Name of the PDF file.
-        content_bytes: Raw bytes of the PDF.
-        mime_type: PDF MIME type.
-
-    Returns:
-        Extracted metadata dictionary.
-    """
+def process_pdf_document(
+    file_name: str, content_bytes: bytes, mime_type: str
+) -> Dict[str, Any]:
+    """Extract text from PDF using pypdf, falling back to Vision OCR on scanned pages."""
     try:
         reader = PdfReader(io.BytesIO(content_bytes))
         pages_text = []
@@ -204,28 +171,86 @@ def process_pdf_document(file_name: str, content_bytes: bytes, mime_type: str) -
         full_text = "\n".join(pages_text).strip()
         if full_text:
             words = full_text.split()
-            word_count = len(words)
             tags = extract_keywords(full_text, max_tags=4)
             if "pdf" not in tags:
                 tags.append("pdf")
             preview = full_text[:200].replace("\n", " ").strip()
             return {
-                "word_count": word_count,
+                "word_count": len(words),
                 "tags": tags[:5],
                 "ocr_preview_snippet": preview,
                 "raw_text_length": len(full_text),
                 "mime_type": mime_type,
             }
-    except Exception:
-        # If PDF is password-protected, corrupt, or unreadable, fall back to simulated OCR
-        pass
 
-    # Scanned PDF without text layer: fallback to deterministic simulated OCR
-    simulated = simulate_ocr(file_name, content_bytes, mime_type)
-    if "scanned-pdf" not in simulated["tags"]:
-        simulated["tags"].insert(0, "scanned-pdf")
-        simulated["tags"] = simulated["tags"][:5]
-    return simulated
+        # If PDF has no text layer, attempt Vision OCR on embedded page images
+        scanned_texts = []
+        scanned_labels: List[str] = []
+        for page in reader.pages[:3]:
+            for img_file in getattr(page, "images", []):
+                ocr_text, labels = perform_vision_ocr(img_file.data)
+                if ocr_text:
+                    scanned_texts.append(ocr_text)
+                scanned_labels.extend(labels)
+
+        scanned_full = "\n".join(scanned_texts).strip()
+        if scanned_full:
+            words = scanned_full.split()
+            tags = ["scanned-pdf"]
+            for lbl in scanned_labels:
+                if lbl not in tags and len(tags) < 5:
+                    tags.append(lbl)
+            for kw in extract_keywords(scanned_full, max_tags=3):
+                if kw not in tags and len(tags) < 5:
+                    tags.append(kw)
+
+            preview = scanned_full[:200].replace("\n", " ").strip()
+            return {
+                "word_count": len(words),
+                "tags": tags[:5],
+                "ocr_preview_snippet": preview,
+                "raw_text_length": len(scanned_full),
+                "mime_type": mime_type,
+            }
+
+    except Exception as exc:
+        logger.warning(f"Error parsing PDF: {exc}")
+
+    return fallback_metadata(file_name, content_bytes, mime_type)
+
+
+def process_image_document(
+    file_name: str, content_bytes: bytes, mime_type: str
+) -> Dict[str, Any]:
+    """Perform real Vision OCR on images (PNG, JPEG, TIFF, WEBP)."""
+    ocr_text, labels = perform_vision_ocr(content_bytes)
+
+    if ocr_text:
+        words = ocr_text.split()
+        ext = os.path.splitext(file_name)[1].lower().strip(".")
+        tags = []
+        if ext:
+            tags.append(f"format-{ext}")
+        for lbl in labels:
+            if lbl not in tags and len(tags) < 5:
+                tags.append(lbl)
+        for kw in extract_keywords(ocr_text, max_tags=3):
+            if kw not in tags and len(tags) < 5:
+                tags.append(kw)
+
+        if not tags:
+            tags = ["image", "ocr"]
+
+        preview = ocr_text[:200].replace("\n", " ").strip()
+        return {
+            "word_count": len(words),
+            "tags": tags[:5],
+            "ocr_preview_snippet": preview,
+            "raw_text_length": len(ocr_text),
+            "mime_type": mime_type,
+        }
+
+    return fallback_metadata(file_name, content_bytes, mime_type, labels=labels)
 
 
 def process_document(
@@ -233,21 +258,7 @@ def process_document(
     content_bytes: bytes,
     content_type: str = "",
 ) -> Dict[str, Any]:
-    """Route document to appropriate processing strategy based on format.
-
-    Args:
-        file_name: Object name in Cloud Storage.
-        content_bytes: Downloaded file content.
-        content_type: Content type from GCS or HTTP header.
-
-    Returns:
-        Dictionary with extracted metadata:
-            - word_count (int)
-            - tags (List[str])
-            - ocr_preview_snippet (str)
-            - raw_text_length (int)
-            - mime_type (str)
-    """
+    """Route document to appropriate processing strategy based on format."""
     inferred_type, _ = mimetypes.guess_type(file_name)
     mime_type = content_type or inferred_type or "application/octet-stream"
     mime_lower = mime_type.lower()
@@ -259,5 +270,5 @@ def process_document(
     if mime_lower == "application/pdf" or ext == ".pdf":
         return process_pdf_document(file_name, content_bytes, mime_type)
 
-    # Images, TIFFs, or binary data
-    return simulate_ocr(file_name, content_bytes, mime_type)
+    # Images and graphics (PNG, JPEG, TIFF, etc.)
+    return process_image_document(file_name, content_bytes, mime_type)
